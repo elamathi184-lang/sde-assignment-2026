@@ -8,6 +8,7 @@ import math
 import os
 import resource
 import sqlite3
+import statistics
 import sys
 import time
 import uuid
@@ -27,6 +28,14 @@ Z_95 = 1.96
 LOCAL_PROPOSAL_CAP = 2
 EARLIEST_APPROVAL_HOUR = 11
 ACTIVE_PROPOSAL_STATES = ("submitting", "pending", "approved", "applying", "auto_submitting")
+FAMILYWISE_ERROR_RATE = 0.05
+
+
+def alpha_spending_z(look: int) -> float:
+    if look < 1:
+        raise ValueError("look must be positive")
+    look_alpha = FAMILYWISE_ERROR_RATE / (look * (look + 1))
+    return statistics.NormalDist().inv_cdf(1 - look_alpha / 4)
 
 
 def wilson_interval(successes: int, total: int, z: float = Z_95) -> tuple[float, float]:
@@ -49,14 +58,19 @@ def sim_hour(value: str) -> str:
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, resume: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
+        had_state = path.exists() and path.stat().st_size > 0
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cursors (
                 name TEXT PRIMARY KEY,
                 chunk INTEGER NOT NULL
@@ -83,7 +97,8 @@ class Store:
                 qa TEXT
             );
             CREATE INDEX IF NOT EXISTS calls_workflow_ts ON call_records(workflow_id, ts);
-            CREATE INDEX IF NOT EXISTS calls_person_ts ON call_records(person_id, ts);
+            CREATE INDEX IF NOT EXISTS calls_experiment_lookup
+                ON call_records(workflow_id, config_version, cohort_id, ts);
             CREATE TABLE IF NOT EXISTS hourly_stats (
                 workflow_id TEXT NOT NULL,
                 cohort_id TEXT NOT NULL,
@@ -118,6 +133,7 @@ class Store:
                 phase TEXT NOT NULL,
                 control TEXT NOT NULL,
                 challenger TEXT NOT NULL DEFAULT '',
+                config_version INTEGER NOT NULL DEFAULT 0,
                 winner TEXT,
                 started_at TEXT NOT NULL,
                 promoted_at TEXT,
@@ -138,6 +154,18 @@ class Store:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(experiments)")}
         if "challenger" not in columns:
             self.db.execute("ALTER TABLE experiments ADD COLUMN challenger TEXT NOT NULL DEFAULT ''")
+        if "config_version" not in columns:
+            self.db.execute("ALTER TABLE experiments ADD COLUMN config_version INTEGER NOT NULL DEFAULT 0")
+        has_cursors = self.db.execute("SELECT 1 FROM cursors LIMIT 1").fetchone() is not None
+        if had_state and has_cursors and not resume:
+            self.db.close()
+            raise RuntimeError(
+                f"controller state already exists at {path}; pass --resume only when reconnecting "
+                "to the same simulator run"
+            )
+        if resume and not has_cursors:
+            self.db.close()
+            raise RuntimeError(f"cannot resume {path}: no persisted simulator cursor was found")
         self.db.commit()
 
     def close(self) -> None:
@@ -146,6 +174,73 @@ class Store:
     def cursor(self, name: str) -> int:
         row = self.db.execute("SELECT chunk FROM cursors WHERE name=?", (name,)).fetchone()
         return row["chunk"] if row else -1
+
+    def bind_run(self, signature: dict[str, Any]) -> None:
+        encoded = json.dumps(signature, sort_keys=True, separators=(",", ":"))
+        with self.db:
+            row = self.db.execute("SELECT value FROM metadata WHERE key='run_signature'").fetchone()
+            if row is not None and row["value"] != encoded:
+                raise RuntimeError(
+                    "saved controller state does not match the live simulator metadata; "
+                    "use a fresh state directory for a new run"
+                )
+            if row is None:
+                if self.cursor("history") >= 0 or self.cursor("events") >= 0:
+                    raise RuntimeError(
+                        "saved controller state has cursors but no run identity; refusing unsafe recovery"
+                    )
+                self.db.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('run_signature', ?)", (encoded,)
+                )
+
+    def experiment_stats(
+        self,
+        workflow_id: str,
+        dimension: str,
+        since: str,
+        config_version: int,
+        cohort_id: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        variant_key = {
+            "voice": "voice",
+            "welcome_message": "welcome_message",
+            "caller_id": "caller_id",
+            "prompt_version": "prompt_version",
+        }[dimension]
+        sql = """SELECT variant, connected, engaged, qa FROM call_records
+                 WHERE workflow_id=? AND config_version=? AND ts>=?"""
+        args: list[Any] = [workflow_id, config_version, since]
+        if cohort_id is not None:
+            sql += " AND cohort_id=?"
+            args.append(cohort_id)
+        if until is not None:
+            sql += " AND ts<?"
+            args.append(until)
+        result: dict[str, dict[str, int]] = {}
+        for row in self.db.execute(sql, args):
+            variant = json.loads(row["variant"]).get(variant_key)
+            if variant is None:
+                continue
+            values = result.setdefault(
+                str(variant),
+                {"dials": 0, "connected": 0, "engaged": 0, "qa_calls": 0, "hallucination_flags": 0},
+            )
+            values["dials"] += 1
+            values["connected"] += row["connected"]
+            values["engaged"] += row["engaged"]
+            qa = json.loads(row["qa"] or "{}")
+            values["qa_calls"] += int(bool(row["connected"]) and "hallucination_flag" in qa)
+            values["hallucination_flags"] += int(
+                bool(row["connected"]) and bool(qa.get("hallucination_flag"))
+            )
+        return result
+
+    def first_observation_time(self, workflow_id: str) -> str | None:
+        row = self.db.execute(
+            "SELECT MIN(ts) AS first_ts FROM call_records WHERE workflow_id=?", (workflow_id,)
+        ).fetchone()
+        return row["first_ts"] if row and row["first_ts"] else None
 
     def ingest_chunk(self, kind: str, chunk: int, lines: str | Iterable[str]) -> int:
         if chunk <= self.cursor(kind):
@@ -220,7 +315,15 @@ class Store:
                     {"actor": event.get("actor"), "version": event.get("version"),
                      "changed_dims": event.get("changed_dims"), "approval_id": event.get("approval_id")},
                 )
-                if event.get("actor") == "supervisor":
+                proposal_id = event.get("proposal_id")
+                proposal = self.db.execute(
+                    "SELECT kind FROM proposals WHERE proposal_id=?", (proposal_id,)
+                ).fetchone() if proposal_id else None
+                changes_experiment = event.get("actor") == "supervisor" or (
+                    proposal is not None
+                    and proposal["kind"] not in ("experiment_explore", "experiment_promote")
+                )
+                if changes_experiment:
                     self.db.execute(
                         """UPDATE experiments SET phase='abandoned', last_action_at=?
                            WHERE workflow_id=? AND phase IN ('exploring', 'promoted')""",
@@ -366,6 +469,23 @@ class Controller:
         }
         if not self.workflows:
             raise RuntimeError("simulator returned no workflows")
+        initial_state = self.get("/sim/state")
+        history_chunks = self.get("/events/chunks", params={"kind": "history", "after": -1})
+        self.store.bind_run({
+            "scenario": initial_state["scenario"],
+            "end_minute": initial_state["end_minute"],
+            "tick_minutes": initial_state["tick_minutes"],
+            "workflows": {
+                workflow_id: {
+                    key: value for key, value in workflow.items() if key != "current_version"
+                }
+                for workflow_id, workflow in self.workflows.items()
+            },
+            "history_chunks": [
+                {key: chunk[key] for key in ("chunk", "first_event_id", "last_event_id", "until_ts")}
+                for chunk in history_chunks
+            ],
+        })
         self.sync_chunks("history")
         self.sync_chunks("events")
         state = self.get("/sim/state")
@@ -546,43 +666,58 @@ class Controller:
                 {"proposal_id": row["proposal_id"], "kind": row["kind"], "detail": detail},
             )
             if state == "applied":
-                self.on_applied(row, now)
+                self.on_applied(row, now, detail)
         LOG.info("%s proposal %s: %s", row["workflow_id"], row["kind"], state)
 
-    def on_applied(self, row: sqlite3.Row, now: str) -> None:
+    def on_applied(self, row: sqlite3.Row, now: str, detail: dict[str, Any]) -> None:
         payload = json.loads(row["payload"])
         kind = row["kind"]
         wid = row["workflow_id"]
         if kind == "experiment_explore":
+            request_payload = payload.get("_request", payload)
+            version = int(detail.get("version", request_payload["base_version"] + 1))
             with self.store.db:
                 self.store.db.execute(
                     """INSERT INTO experiments
-                       (workflow_id, dimension, cohort_id, phase, control, challenger, winner,
-                        started_at, promoted_at, baseline_config, baseline_pickup,
+                       (workflow_id, dimension, cohort_id, phase, control, challenger, config_version,
+                        winner, started_at, promoted_at, baseline_config, baseline_pickup,
                         baseline_engagement, last_action_at)
-                       VALUES (?, ?, 'default', 'exploring', ?, ?, NULL, ?, NULL, ?, ?, ?, ?)
+                       VALUES (?, ?, 'default', 'exploring', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)
                        ON CONFLICT(workflow_id) DO UPDATE SET
                          dimension=excluded.dimension, cohort_id='default', phase='exploring',
                          control=excluded.control, challenger=excluded.challenger,
-                         winner=NULL, started_at=excluded.started_at,
-                         promoted_at=NULL, baseline_config=excluded.baseline_config,
+                         config_version=excluded.config_version, winner=NULL,
+                         started_at=excluded.started_at, promoted_at=NULL,
+                         baseline_config=excluded.baseline_config,
                          baseline_pickup=excluded.baseline_pickup,
                          baseline_engagement=excluded.baseline_engagement,
                          last_action_at=excluded.last_action_at""",
-                    (wid, payload["dimension"], payload["control"], payload["challenger"], now,
-                     json.dumps(payload["baseline_config"]),
-                     payload.get("baseline_pickup"), payload.get("baseline_engagement"), now),
+                    (
+                        wid, payload["dimension"], payload["control"], payload["challenger"],
+                        version, now, json.dumps(payload["baseline_config"]),
+                        payload.get("baseline_pickup"), payload.get("baseline_engagement"), now,
+                    ),
                 )
         elif kind == "experiment_promote":
+            request_payload = payload.get("_request", payload)
+            version = int(detail.get("version", request_payload["base_version"] + 1))
             with self.store.db:
                 self.store.db.execute(
-                    "UPDATE experiments SET phase='promoted', winner=?, promoted_at=?, last_action_at=? WHERE workflow_id=?",
-                    (payload["winner"], now, now, wid),
+                    """UPDATE experiments SET phase='promoted', winner=?, config_version=?,
+                       promoted_at=?, last_action_at=? WHERE workflow_id=?""",
+                    (payload["winner"], version, now, now, wid),
                 )
         elif kind in ("experiment_rollback", "guardrail_rollback"):
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE experiments SET phase='rolled_back', last_action_at=? WHERE workflow_id=?",
+                    (now, wid),
+                )
+        elif kind in ("caller_id_health", "prompt_incident"):
+            with self.store.db:
+                self.store.db.execute(
+                    """UPDATE experiments SET phase='abandoned', last_action_at=?
+                       WHERE workflow_id=? AND phase IN ('exploring', 'promoted')""",
                     (now, wid),
                 )
 
@@ -615,9 +750,6 @@ class Controller:
         return max(remote_count, local_count) < allowed_requests
 
     def caller_id_incident(self, wid: str, workflow: dict[str, Any], now: str) -> dict[str, Any] | None:
-        experiment = self.store.experiment(wid)
-        if experiment and experiment["dimension"] == "caller_id" and experiment["phase"] in ("exploring", "promoted"):
-            return None
         recent_health_change = self.store.db.execute(
             """SELECT created_at FROM proposals
                WHERE workflow_id=? AND kind='caller_id_health' AND state='applied'
@@ -650,6 +782,8 @@ class Controller:
                     if not distribution or did not in distribution or len(distribution) < 2:
                         continue
                     mass = distribution[did] * 0.5
+                    if mass <= 1e-6:
+                        continue
                     distribution[did] -= mass
                     others = [name for name in distribution if name != did]
                     total = sum(distribution[name] for name in others)
@@ -766,7 +900,7 @@ class Controller:
     def create_change(self, wid: str, workflow: dict[str, Any], decision: dict[str, Any], now: str) -> bool:
         current = self.get(f"/workflows/{wid}/config")
         cfg = decision["config"]
-        if cfg == current["config"]:
+        if configs_equivalent(cfg, current["config"]):
             return False
         if not self.can_request(wid, workflow, now):
             return False
@@ -874,6 +1008,10 @@ class Controller:
         if exp is None:
             self.start_experiment(wid, workflow, now)
             return
+        if exp["phase"] in ("abandoned", "rolled_back"):
+            if parse_ts(now) - parse_ts(exp["last_action_at"]) >= timedelta(hours=24):
+                self.start_experiment(wid, workflow, now)
+            return
         if exp["phase"] not in ("exploring", "promoted"):
             return
         guardrail = self.guardrail_breached(wid, workflow, exp, now)
@@ -905,6 +1043,31 @@ class Controller:
             control: 0.8,
             challenger: 0.2,
         }
+        if configs_equivalent(cfg, current["config"]):
+            with self.store.db:
+                self.store.db.execute(
+                    """INSERT INTO experiments
+                       (workflow_id, dimension, cohort_id, phase, control, challenger, config_version,
+                        winner, started_at, promoted_at, baseline_config, last_action_at)
+                       VALUES (?, ?, 'default', 'exploring', ?, ?, ?, NULL, ?, NULL, ?, ?)
+                       ON CONFLICT(workflow_id) DO UPDATE SET
+                         dimension=excluded.dimension, cohort_id='default', phase='exploring',
+                         control=excluded.control, challenger=excluded.challenger,
+                         config_version=excluded.config_version, winner=NULL,
+                         started_at=excluded.started_at, promoted_at=NULL,
+                         baseline_config=excluded.baseline_config,
+                         last_action_at=excluded.last_action_at""",
+                    (
+                        wid, dimension, control, challenger, current["version"], now,
+                        json.dumps(current["config"]), now,
+                    ),
+                )
+                self.store.audit(
+                    now, wid, "experiment_started_existing_allocation",
+                    {"dimension": dimension, "control": control, "challenger": challenger,
+                     "config_version": current["version"]},
+                )
+            return
         baseline = self.store.recent_stats(
             wid, dimension, (parse_ts(now) - timedelta(hours=48)).isoformat(), "default"
         )
@@ -943,7 +1106,9 @@ class Controller:
 
     def try_promote(self, wid: str, workflow: dict[str, Any], exp: sqlite3.Row, now: str) -> None:
         since = exp["started_at"]
-        stats = self.store.recent_stats(wid, exp["dimension"], since, exp["cohort_id"])
+        stats = self.store.experiment_stats(
+            wid, exp["dimension"], since, exp["config_version"], exp["cohort_id"]
+        )
         control = stats.get(exp["control"])
         if not control:
             return
@@ -952,7 +1117,10 @@ class Controller:
         min_n = MIN_VARIANT_CONNECTIONS if primary == "engagement_rate" else MIN_VARIANT_DIALS
         if control_n < min_n:
             return
-        control_low, control_high = wilson_interval(control_success, control_n)
+        look_reference = exp["promoted_at"] if exp["phase"] == "promoted" else exp["started_at"]
+        look = sequential_look(now, look_reference)
+        z = alpha_spending_z(look)
+        control_low, control_high = wilson_interval(control_success, control_n, z)
         candidates = []
         option = exp["challenger"]
         values = stats.get(option)
@@ -960,7 +1128,7 @@ class Controller:
             success, n = primary_counts(values, primary)
             min_n = MIN_VARIANT_CONNECTIONS if primary == "engagement_rate" else MIN_VARIANT_DIALS
             if n >= min_n:
-                low, high = wilson_interval(success, n)
+                low, high = wilson_interval(success, n, z)
                 if low > control_high:
                     candidates.append((low, success / n, option, n, high))
         if not candidates or not self.can_request(wid, workflow, now):
@@ -974,12 +1142,16 @@ class Controller:
             "config": cfg,
             "dimension": exp["dimension"],
             "winner": winner,
-            "rationale": f"{winner} has a 95% Wilson lower bound above the control's upper bound after {n} relevant observations; promoting cautiously while retaining 40% control.",
+            "rationale": (
+                f"{winner}'s alpha-spending-adjusted Wilson lower bound exceeds the control's upper "
+                f"bound after {n} relevant observations; promoting cautiously while retaining 40% control."
+            ),
             "summary": f"Promote {winner} cautiously for {exp['dimension']}",
             "evidence": {"winner": winner, "winner_rate": rate, "winner_n": n,
                          "control": exp["control"], "control_rate": control_success / control_n,
                          "control_n": control_n, "winner_ci_upper": high,
-                         "control_ci": [control_low, control_high]},
+                         "control_ci": [control_low, control_high],
+                         "look": look, "look_alpha": FAMILYWISE_ERROR_RATE / (look * (look + 1))},
         }
         self.create_change(wid, workflow, decision, now)
 
@@ -993,7 +1165,9 @@ class Controller:
         since = (parse_ts(now) - timedelta(hours=48)).isoformat()
         primary = workflow["objective"]["primary"]
         guard_name = "pickup_rate" if primary == "engagement_rate" else "engagement_rate"
-        stats = self.store.recent_stats(wid, exp["dimension"], since, exp["cohort_id"])
+        stats = self.store.experiment_stats(
+            wid, exp["dimension"], since, exp["config_version"], exp["cohort_id"]
+        )
         treatment_name = exp["winner"] if exp["phase"] == "promoted" else exp["challenger"]
         treatment = stats.get(treatment_name)
         control = stats.get(exp["control"])
@@ -1013,8 +1187,10 @@ class Controller:
             min_sample = MIN_VARIANT_CONNECTIONS
         if treatment_n < min_sample or control_n < min_sample:
             return None
-        treatment_upper = wilson_interval(treatment_success, treatment_n)[1]
-        control_lower = wilson_interval(control_success, control_n)[0]
+        look = sequential_look(now, exp["started_at"])
+        z = alpha_spending_z(look)
+        treatment_upper = wilson_interval(treatment_success, treatment_n, z)[1]
+        control_lower = wilson_interval(control_success, control_n, z)[0]
         treatment_rate = treatment_success / treatment_n
         control_rate = control_success / control_n
         if treatment_upper < control_lower - float(threshold):
@@ -1028,6 +1204,7 @@ class Controller:
                 "control_rate": control_rate,
                 "control_lower_95": control_lower,
                 "control_n": control_n,
+                "look": look,
                 "max_drop": threshold,
             }
         return None
@@ -1035,8 +1212,10 @@ class Controller:
     def try_decay_rollback(self, wid: str, workflow: dict[str, Any], exp: sqlite3.Row, now: str) -> None:
         if not exp["winner"] or not exp["promoted_at"]:
             return
-        since = (parse_ts(now) - timedelta(hours=24)).isoformat()
-        stats = self.store.recent_stats(wid, exp["dimension"], since, exp["cohort_id"])
+        since = max(exp["promoted_at"], (parse_ts(now) - timedelta(hours=24)).isoformat())
+        stats = self.store.experiment_stats(
+            wid, exp["dimension"], since, exp["config_version"], exp["cohort_id"]
+        )
         winner = stats.get(exp["winner"])
         control = stats.get(exp["control"])
         if not winner or not control:
@@ -1047,8 +1226,10 @@ class Controller:
         min_n = MIN_VARIANT_CONNECTIONS if primary == "engagement_rate" else MIN_VARIANT_DIALS
         if w_n < min_n or c_n < min_n:
             return
-        _, winner_high = wilson_interval(w_success, w_n)
-        control_low, _ = wilson_interval(c_success, c_n)
+        look = sequential_look(now, exp["promoted_at"])
+        z = alpha_spending_z(look)
+        _, winner_high = wilson_interval(w_success, w_n, z)
+        control_low, _ = wilson_interval(c_success, c_n, z)
         if control_low > winner_high:
             self.propose_rollback(
                 wid, workflow, exp, now, "experiment_rollback",
@@ -1077,7 +1258,7 @@ class Controller:
             "summary": "Restore the pre-experiment configuration",
             "evidence": evidence,
         }
-        if cfg != current["config"]:
+        if not configs_equivalent(cfg, current["config"]):
             self.create_change(wid, workflow, decision, now)
 
 
@@ -1101,6 +1282,45 @@ def calculate_rates(stats: dict[str, dict[str, int]]) -> dict[str, float | int]:
     return result
 
 
+def sequential_look(now: str, started_at: str) -> int:
+    elapsed_hours = int((parse_ts(now) - parse_ts(started_at)).total_seconds() // 3600)
+    return max(1, elapsed_hours + 1)
+
+
+def configs_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if any(left.get(key) != right.get(key) for key in ("cohorts", "prompt_version", "schedule")):
+        return False
+    cohort_ids = {"default"}
+    cohort_ids.update(cohort["id"] for cohort in left.get("cohorts", []))
+    cohort_ids.update(cohort["id"] for cohort in right.get("cohorts", []))
+    for cohort_id in cohort_ids:
+        for dimension in ("welcome_message", "voice", "caller_id"):
+            left_dist = (
+                left.get("allocations", {}).get(cohort_id, {}).get(dimension)
+                or left.get("allocations", {}).get("default", {}).get(dimension, {})
+            )
+            right_dist = (
+                right.get("allocations", {}).get(cohort_id, {}).get(dimension)
+                or right.get("allocations", {}).get("default", {}).get(dimension, {})
+            )
+            options = set(left_dist) | set(right_dist)
+            left_total = sum(left_dist.values())
+            right_total = sum(right_dist.values())
+            if left_total <= 0 or right_total <= 0:
+                return False
+            if any(
+                not math.isclose(
+                    left_dist.get(option, 0) / left_total,
+                    right_dist.get(option, 0) / right_total,
+                    rel_tol=0,
+                    abs_tol=1e-8,
+                )
+                for option in options
+            ):
+                return False
+    return True
+
+
 def max_distribution_shift(old: dict[str, Any], new: dict[str, Any]) -> float:
     keys = {"default"}
     keys.update(c["id"] for c in old.get("cohorts", []))
@@ -1122,6 +1342,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the outcome-first controller against the simulator.")
     parser.add_argument("--url", default=os.environ.get("SIM_URL", "http://127.0.0.1:8700"))
     parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("CONTROLLER_STATE_DIR", "runs/controller-state")))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=os.environ.get("CONTROLLER_RESUME", "").lower() in ("1", "true", "yes"),
+        help="resume state only when reconnecting to the same simulator run",
+    )
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 
@@ -1137,7 +1363,7 @@ def main() -> None:
         response = client.get("/sim/state")
         response.raise_for_status()
         scenario = response.json()["scenario"]
-    store = Store(args.state_dir / f"{scenario}.sqlite3")
+    store = Store(args.state_dir / f"{scenario}.sqlite3", resume=args.resume)
     controller = Controller(args.url, store)
     try:
         controller.run()

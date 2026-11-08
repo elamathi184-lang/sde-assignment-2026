@@ -73,7 +73,7 @@ if wait "${CONTROLLER_PID}"; then
 fi
 echo "Killed controller at simulated minute ${SIM_MINUTE}; restarting with the same SQLite state."
 
-python -m controller --url "${URL}" --state-dir "${STATE_DIR}" \
+python -m controller --url "${URL}" --state-dir "${STATE_DIR}" --resume \
   >"${LOG_DIR}/controller-after-restart.log" 2>&1
 curl --silent --fail "${URL}/sim/state" | python -c \
   'import json,sys; s=json.load(sys.stdin); print(s); sys.exit(0 if s["finished"] else 1)'

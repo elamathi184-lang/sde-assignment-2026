@@ -80,9 +80,11 @@ python -m sim serve    --scenario scenarios/public_01_dev.yaml --run-dir runs/mi
 python -m sim grade --run runs/mine01 --baseline runs/base01 --out reports/public_01.md
 ```
 
-The controller stores its restart state in `runs/controller-state/<scenario>.sqlite3`. Reuse the same
-`CONTROLLER_STATE_DIR` when restarting a controller; set it to a persistent mounted directory outside
-`runs/` when the run directory may be cleaned. Use a separate state directory for each concurrent run.
+The controller stores its state in `runs/controller-state/<scenario>.sqlite3`. For a recovery, reuse the
+same `CONTROLLER_STATE_DIR` and pass `--resume` (or set `CONTROLLER_RESUME=1`); the controller validates
+the saved scenario metadata before resuming. Use a fresh state directory for a new run, or a persistent
+mounted directory outside `runs/` if the run directory may be cleaned. Use a separate directory for each
+concurrent run.
 To demonstrate a kill/restart recovery on public_01, run `bash scripts/crash_recovery_demo.sh`; it
 keeps the simulator, controller logs, and SQLite state under a timestamped `runs/crash-recovery-*` path.
 
