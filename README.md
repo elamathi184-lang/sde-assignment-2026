@@ -91,6 +91,11 @@ The controller implementation is split into `autonomy_controller/`: `models.py` 
 SQLAlchemy models, `store.py` owns ORM/Core persistence and migrations, `service.py` runs the controller,
 and `decisions.py`, `governance.py` and `statistics.py` hold the corresponding decision logic. SQLite
 queries and upserts use SQLAlchemy; driver SQL is limited to SQLite pragmas and schema migrations.
+Non-secret controller policy thresholds are loaded from `credentials.env` when present; copy
+`credentials.env.example` to configure the defaults. The local env file is ignored by Git; do not put
+secrets in it.
+Equivalent environment variables override values from the file, and `CONTROLLER_ENV_FILE` can select
+another env-file path.
 To demonstrate a kill/restart recovery on public_01, run `bash scripts/crash_recovery_demo.sh`; it
 keeps the simulator, controller logs, and SQLite state under a timestamped `runs/crash-recovery-*` path.
 
