@@ -69,55 +69,91 @@ class DecisionMixin:
         if recent_health_change and parse_ts(now) - parse_ts(recent_health_change["created_at"]) < timedelta(hours=48):
             return None
         since = (parse_ts(now) - timedelta(hours=48)).isoformat()
-        stats = self.store.recent_stats(wid, "caller_id", since)
-        if len(stats) < 2:
-            return None
-        for did, values in sorted(stats.items()):
-            if values["dials"] < 100:
+        stats_by_cohort = self.store.recent_stats_by_cohort(wid, "caller_id", since)
+        total_dials = sum(
+            values["dials"] for stats in stats_by_cohort.values() for values in stats.values()
+        )
+        current = None
+        for cohort_id, stats in sorted(stats_by_cohort.items()):
+            if len(stats) < 2:
                 continue
-            other_dials = sum(v["dials"] for k, v in stats.items() if k != did)
-            other_connected = sum(v["connected"] for k, v in stats.items() if k != did)
-            if other_dials < 100:
-                continue
-            did_rate = values["connected"] / values["dials"]
-            other_rate = other_connected / other_dials
-            did_upper = wilson_interval(values["connected"], values["dials"])[1]
-            other_lower = wilson_interval(other_connected, other_dials)[0]
-            if did_rate <= other_rate - 0.10 and did_upper < other_lower:
-                current = self.get(f"/workflows/{wid}/config")
+            for did, values in sorted(stats.items()):
+                if values["dials"] < 100:
+                    continue
+                other_dials = sum(v["dials"] for k, v in stats.items() if k != did)
+                other_connected = sum(v["connected"] for k, v in stats.items() if k != did)
+                if other_dials < 100:
+                    continue
+                did_rate = values["connected"] / values["dials"]
+                other_rate = other_connected / other_dials
+                did_upper = wilson_interval(values["connected"], values["dials"])[1]
+                other_lower = wilson_interval(other_connected, other_dials)[0]
+                if did_rate > other_rate - 0.10 or did_upper >= other_lower:
+                    continue
+
+                if current is None:
+                    current = self.get(f"/workflows/{wid}/config")
                 cfg = copy.deepcopy(current["config"])
-                changed = False
-                for distributions in cfg["allocations"].values():
-                    distribution = distributions.get("caller_id")
-                    if not distribution or did not in distribution or len(distribution) < 2:
+                allocations = cfg["allocations"]
+                default_distribution = allocations.get("default", {}).get("caller_id")
+                if cohort_id == "default":
+                    if not default_distribution:
                         continue
-                    mass = distribution[did] * 0.5
-                    if mass <= 1e-6:
-                        continue
-                    distribution[did] -= mass
-                    others = [name for name in distribution if name != did]
-                    total = sum(distribution[name] for name in others)
-                    if total <= 0:
-                        alternatives = [o for o in workflow["options"]["caller_id"] if o != did]
-                        if not alternatives:
+                    for cohort in cfg.get("cohorts", []):
+                        cohort_allocations = allocations.get(cohort["id"], {})
+                        if not cohort_allocations.get("caller_id"):
+                            allocations.setdefault(cohort["id"], {})["caller_id"] = copy.deepcopy(
+                                default_distribution
+                            )
+                    distribution = allocations["default"]["caller_id"]
+                else:
+                    cohort_allocations = allocations.get(cohort_id, {})
+                    distribution = cohort_allocations.get("caller_id")
+                    if not distribution:
+                        if not default_distribution:
                             continue
-                        distribution[alternatives[0]] = distribution.get(alternatives[0], 0) + mass
-                    else:
-                        for name in others:
-                            distribution[name] += mass * distribution[name] / total
-                    distribution[did] = round(distribution[did], 6)
-                    for name in distribution:
-                        distribution[name] = round(distribution[name], 6)
-                    changed = True
-                if changed:
-                    return {
-                        "kind": "caller_id_health",
-                        "config": cfg,
-                        "rationale": f"Reduced {did} allocation after {values['dials']} dials showed pickup {did_rate:.1%} versus {other_rate:.1%} for other caller IDs.",
-                        "evidence": {"caller_id": did, "dials": values["dials"], "pickup_rate": did_rate,
-                                    "other_dials": other_dials, "other_pickup_rate": other_rate},
-                        "dimension": "caller_id",
-                    }
+                        distribution = copy.deepcopy(default_distribution)
+                        allocations.setdefault(cohort_id, {})["caller_id"] = distribution
+
+                if did not in distribution or len(distribution) < 2:
+                    continue
+                mass = distribution[did] * 0.5
+                if mass <= 1e-6:
+                    continue
+                distribution[did] -= mass
+                others = [name for name in distribution if name != did]
+                total = sum(distribution[name] for name in others)
+                if total <= 0:
+                    alternatives = [option for option in workflow["options"]["caller_id"] if option != did]
+                    if not alternatives:
+                        continue
+                    distribution[alternatives[0]] = distribution.get(alternatives[0], 0) + mass
+                else:
+                    for name in others:
+                        distribution[name] += mass * distribution[name] / total
+                distribution[did] = round(distribution[did], 6)
+                for name in distribution:
+                    distribution[name] = round(distribution[name], 6)
+                cohort_dials = sum(values["dials"] for values in stats.values())
+                return {
+                    "kind": "caller_id_health",
+                    "config": cfg,
+                    "rationale": (
+                        f"Reduced {did} allocation for cohort {cohort_id} after {values['dials']} "
+                        f"dials showed pickup {did_rate:.1%} versus {other_rate:.1%} for other caller IDs."
+                    ),
+                    "evidence": {
+                        "caller_id": did,
+                        "cohort_id": cohort_id,
+                        "dials": values["dials"],
+                        "pickup_rate": did_rate,
+                        "other_dials": other_dials,
+                        "other_pickup_rate": other_rate,
+                        "cohort_share": cohort_dials / total_dials if total_dials else 0,
+                        "allocation_reduction": mass,
+                    },
+                    "dimension": "caller_id",
+                }
         return None
 
     def prompt_incident(self, wid: str, workflow: dict[str, Any], now: str, credits: float | None) -> dict[str, Any] | None:
@@ -250,8 +286,16 @@ class DecisionMixin:
         affected = decision.get("affected_leads")
         if affected is None and decision.get("kind") == "caller_id_health":
             did = stats.get("caller_id")
-            allocation = current["config"].get("allocations", {}).get("default", {}).get("caller_id", {})
-            affected = round(batch_size * allocation.get(did, 0))
+            cohort_id = stats.get("cohort_id", "default")
+            allocations = current["config"].get("allocations", {})
+            allocation = allocations.get(cohort_id, {}).get("caller_id")
+            if not allocation:
+                allocation = allocations.get("default", {}).get("caller_id", {})
+            cohort_share = float(stats.get("cohort_share", 1))
+            allocation_reduction = float(
+                stats.get("allocation_reduction", allocation.get(did, 0))
+            )
+            affected = round(batch_size * cohort_share * allocation_reduction)
         if affected is None:
             affected = batch_size
         estimated_lift = stats.get("estimated_lift")

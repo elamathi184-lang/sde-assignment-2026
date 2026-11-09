@@ -14,6 +14,7 @@ from controller import (
     sequential_look,
     wilson_interval,
 )
+from autonomy_controller.decisions import DecisionMixin
 from autonomy_controller.models import (
     AuditRecord,
     ExperimentRecord,
@@ -65,10 +66,22 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
     }
     assert calculate_rates(voice)["engagement_rate"] == 1
     assert not inspect(store.engine).has_table("call_records")
-    version_two_event = {**event, "event_id": 8, "config_version": 2, "variant": {
+    other_cohort_event = {
+        **event,
+        "event_id": 8,
+        "cohort_id": "senior",
+        "variant": {**event["variant"], "caller_id": "D2"},
+    }
+    assert store.ingest_chunk("events", 4, json.dumps(other_cohort_event) + "\n") == 1
+    caller_id_stats = store.recent_stats_by_cohort(
+        "wf", "caller_id", "2027-01-04T00:00:00+05:30"
+    )
+    assert caller_id_stats["default"]["D1"]["dials"] == 1
+    assert caller_id_stats["senior"]["D2"]["dials"] == 1
+    version_two_event = {**event, "event_id": 9, "config_version": 2, "variant": {
         **event["variant"], "voice": "V2",
     }}
-    assert store.ingest_chunk("events", 4, json.dumps(version_two_event) + "\n") == 1
+    assert store.ingest_chunk("events", 5, json.dumps(version_two_event) + "\n") == 1
     experiment_stats = store.experiment_stats(
         "wf", "voice", "2027-01-04T00:00:00+05:30", config_version=2
     )
@@ -84,6 +97,106 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
         "wf", "voice", "2027-01-04T10:30:00+05:30", config_version=2
     ) == {}
     store.close()
+
+
+def test_caller_id_incident_changes_only_the_affected_cohort():
+    class IncidentStore:
+        def latest_proposal(self, workflow_id, kind, state):
+            return None
+
+        def recent_stats_by_cohort(self, workflow_id, dimension, since):
+            return {
+                "good": {
+                    "D1": {"dials": 200, "connected": 180},
+                    "D2": {"dials": 200, "connected": 170},
+                },
+                "weak": {
+                    "D1": {"dials": 200, "connected": 10},
+                    "D2": {"dials": 200, "connected": 160},
+                },
+            }
+
+    class IncidentController(DecisionMixin):
+        def __init__(self):
+            self.store = IncidentStore()
+            self.config = {
+                "version": 1,
+                "config": {
+                    "cohorts": [{"id": "good"}, {"id": "weak"}],
+                    "allocations": {
+                        "default": {"caller_id": {"D1": 0.5, "D2": 0.5}},
+                        "good": {"caller_id": {"D1": 0.7, "D2": 0.3}},
+                    },
+                },
+            }
+
+        def get(self, path):
+            return self.config
+
+    controller = IncidentController()
+    incident = controller.caller_id_incident(
+        "wf",
+        {"options": {"caller_id": ["D1", "D2"]}},
+        "2027-01-04T12:00:00+05:30",
+    )
+
+    assert incident is not None
+    assert incident["evidence"]["cohort_id"] == "weak"
+    assert incident["evidence"]["cohort_share"] == 0.5
+    assert incident["evidence"]["allocation_reduction"] == 0.25
+    assert incident["config"]["allocations"]["good"]["caller_id"] == {"D1": 0.7, "D2": 0.3}
+    assert incident["config"]["allocations"]["default"]["caller_id"] == {"D1": 0.5, "D2": 0.5}
+    assert incident["config"]["allocations"]["weak"]["caller_id"] == {"D1": 0.25, "D2": 0.75}
+    proposal = controller.proposal_body(
+        "wf",
+        {"daily_batch": {"size": 1000}},
+        controller.config,
+        incident["config"],
+        incident,
+        "2027-01-04T12:00:00+05:30",
+    )
+    assert proposal["affected_leads"] == 125
+
+
+def test_default_caller_id_incident_preserves_named_cohort_inheritance():
+    class IncidentStore:
+        def latest_proposal(self, workflow_id, kind, state):
+            return None
+
+        def recent_stats_by_cohort(self, workflow_id, dimension, since):
+            return {
+                "default": {
+                    "D1": {"dials": 200, "connected": 10},
+                    "D2": {"dials": 200, "connected": 160},
+                },
+                "senior": {"D1": {"dials": 200, "connected": 180}},
+            }
+
+    class IncidentController(DecisionMixin):
+        def __init__(self):
+            self.store = IncidentStore()
+            self.config = {
+                "version": 1,
+                "config": {
+                    "cohorts": [{"id": "senior"}],
+                    "allocations": {"default": {"caller_id": {"D1": 0.5, "D2": 0.5}}},
+                },
+            }
+
+        def get(self, path):
+            return self.config
+
+    controller = IncidentController()
+    incident = controller.caller_id_incident(
+        "wf",
+        {"options": {"caller_id": ["D1", "D2"]}},
+        "2027-01-04T12:00:00+05:30",
+    )
+
+    assert incident is not None
+    assert incident["evidence"]["cohort_id"] == "default"
+    assert incident["config"]["allocations"]["default"]["caller_id"] == {"D1": 0.25, "D2": 0.75}
+    assert incident["config"]["allocations"]["senior"]["caller_id"] == {"D1": 0.5, "D2": 0.5}
 
 
 def test_experiment_stats_backfills_legacy_rows_once_after_upgrade(tmp_path):

@@ -409,6 +409,39 @@ class Store:
             for row in rows
         }
 
+    def recent_stats_by_cohort(
+        self,
+        workflow_id: str,
+        dimension: str,
+        since: str,
+        until: str | None = None,
+    ) -> dict[str, dict[str, dict[str, int]]]:
+        statement = select(
+            HourlyStat.cohort_id,
+            HourlyStat.variant,
+            func.sum(HourlyStat.dials).label("dials"),
+            func.sum(HourlyStat.connected).label("connected"),
+            func.sum(HourlyStat.engaged).label("engaged"),
+            func.sum(HourlyStat.qa_calls).label("qa_calls"),
+            func.sum(HourlyStat.hallucination_flags).label("hallucination_flags"),
+        ).where(
+            HourlyStat.workflow_id == workflow_id,
+            HourlyStat.dimension == dimension,
+            HourlyStat.hour >= since[:13],
+        )
+        if until is not None:
+            statement = statement.where(HourlyStat.hour < until[:13])
+        statement = statement.group_by(HourlyStat.cohort_id, HourlyStat.variant)
+        with self.session_factory() as session:
+            rows = session.execute(statement).all()
+        result: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
+        for row in rows:
+            result[row.cohort_id][row.variant] = {
+                key: int(getattr(row, key) or 0)
+                for key in ("dials", "connected", "engaged", "qa_calls", "hallucination_flags")
+            }
+        return dict(result)
+
     def open_proposals(self, workflow_id: str | None = None) -> list[ProposalRecord]:
         statement = select(ProposalRecord).where(ProposalRecord.state.in_(ACTIVE_PROPOSAL_STATES))
         if workflow_id is not None:
