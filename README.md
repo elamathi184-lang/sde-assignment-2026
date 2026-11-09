@@ -97,7 +97,10 @@ secrets in it.
 Equivalent environment variables override values from the file, and `CONTROLLER_ENV_FILE` can select
 another env-file path.
 To demonstrate a kill/restart recovery on public_01, run `bash scripts/crash_recovery_demo.sh`; it
-keeps the simulator, controller logs, and SQLite state under a timestamped `runs/crash-recovery-*` path.
+waits for a pending approval and persisted experiment state before killing the controller, resumes with
+the same SQLite state, and verifies proposal reconciliation, aggregate state retention, and unique
+application history. It keeps the simulator, controller logs, and SQLite state under a timestamped
+`runs/crash-recovery-*` path.
 
 **Ground rules for the simulator**
 - Your controller may only know what the HTTP API tells it. Reading `runs/`, importing `sim`, or parsing

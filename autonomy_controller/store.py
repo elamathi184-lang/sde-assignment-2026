@@ -40,6 +40,7 @@ class Store:
         self.session_factory = sessionmaker(self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
         self._migrate_experiment_schema()
+        self._migrate_audit_schema()
 
         with self.session_factory() as session:
             has_cursors = session.scalar(select(CursorRecord.name).limit(1)) is not None
@@ -65,6 +66,15 @@ class Store:
                 connection.exec_driver_sql(
                     "ALTER TABLE experiments ADD COLUMN config_version INTEGER NOT NULL DEFAULT 0"
                 )
+
+    def _migrate_audit_schema(self) -> None:
+        columns = {column["name"] for column in inspect(self.engine).get_columns("audit")}
+        with self.engine.begin() as connection:
+            if "event_key" not in columns:
+                connection.exec_driver_sql("ALTER TABLE audit ADD COLUMN event_key VARCHAR")
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_event_key ON audit (event_key)"
+            )
 
     def _migrate_legacy_records(self) -> None:
         table_names = set(inspect(self.engine).get_table_names())
@@ -362,17 +372,28 @@ class Store:
         detail: dict[str, Any],
         *,
         session: Session | None = None,
+        event_key: str | None = None,
     ) -> None:
         if session is not None:
-            session.add(AuditRecord(
-                ts=ts,
-                workflow_id=workflow_id,
-                kind=kind,
-                detail=json.dumps(detail, sort_keys=True),
-            ))
+            values = {
+                "ts": ts,
+                "workflow_id": workflow_id,
+                "kind": kind,
+                "detail": json.dumps(detail, sort_keys=True),
+                "event_key": event_key,
+            }
+            if event_key is None:
+                session.add(AuditRecord(**values))
+            else:
+                statement = sqlite_insert(AuditRecord).values(**values)
+                session.execute(
+                    statement.on_conflict_do_nothing(index_elements=[AuditRecord.event_key])
+                )
             return
         with self.session_factory.begin() as owned_session:
-            self.audit(ts, workflow_id, kind, detail, session=owned_session)
+            self.audit(
+                ts, workflow_id, kind, detail, session=owned_session, event_key=event_key
+            )
 
     def recent_stats(
         self,

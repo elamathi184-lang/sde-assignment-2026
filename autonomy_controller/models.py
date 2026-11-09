@@ -185,6 +185,7 @@ class AuditRecord(RowAccess, Base):
     workflow_id: Mapped[str | None] = mapped_column(String)
     kind: Mapped[str] = mapped_column(String, nullable=False)
     detail: Mapped[str] = mapped_column(Text, nullable=False)
+    event_key: Mapped[str | None] = mapped_column(String)
 
 
 class LegacyCallRecord(LegacyBase):

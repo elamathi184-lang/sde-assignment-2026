@@ -39,15 +39,114 @@ class DecisionMixin:
     def make_decisions(self, state: dict[str, Any]) -> None:
         now = state["ts"]
         for wid, workflow in self.workflows.items():
-            if self.store.open_proposals(wid):
+            checks: list[dict[str, Any]] = []
+            pending = self.store.open_proposals(wid)
+            if pending:
+                checks.append({
+                    "check": "open_proposals",
+                    "outcome": "blocked",
+                    "proposal_ids": [proposal["proposal_id"] for proposal in pending],
+                })
+                checks.extend([
+                    {
+                        "check": "caller_id_health",
+                        "outcome": "skipped",
+                        "reason": "an approval is already open for this workflow",
+                    },
+                    {
+                        "check": "prompt_incident",
+                        "outcome": "skipped",
+                        "reason": "an approval is already open for this workflow",
+                    },
+                    {
+                        "check": "experiment",
+                        "outcome": "skipped",
+                        "reason": "an approval is already open for this workflow",
+                    },
+                ])
+                self._audit_decision_checks(wid, now, checks)
                 continue
+
             incident = self.caller_id_incident(wid, workflow, now)
-            if incident and self.create_change(wid, workflow, incident, now):
-                continue
+            checks.append({
+                "check": "caller_id_health",
+                "outcome": "candidate" if incident else "no_action",
+                **({"evidence": incident["evidence"]} if incident else {}),
+            })
+            if incident:
+                created = self.create_change(wid, workflow, incident, now)
+                checks[-1]["proposal_created"] = created
+                if created:
+                    checks.extend([
+                        {"check": "prompt_incident", "outcome": "skipped", "reason": "caller ID proposal created"},
+                        {"check": "experiment", "outcome": "skipped", "reason": "caller ID proposal created"},
+                    ])
+                    self._audit_decision_checks(wid, now, checks)
+                    continue
+
             prompt = self.prompt_incident(wid, workflow, now, state.get("credits_remaining"))
-            if prompt and self.create_prompt_change(wid, workflow, prompt, now, state.get("credits_remaining")):
-                continue
+            checks.append({
+                "check": "prompt_incident",
+                "outcome": "candidate" if prompt else "no_action",
+                **({"evidence": prompt} if prompt else {}),
+            })
+            if prompt:
+                created = self.create_prompt_change(
+                    wid, workflow, prompt, now, state.get("credits_remaining")
+                )
+                checks[-1]["proposal_created"] = created
+                if created:
+                    checks.append({
+                        "check": "experiment",
+                        "outcome": "skipped",
+                        "reason": "prompt incident proposal created",
+                    })
+                    self._audit_decision_checks(wid, now, checks)
+                    continue
+
+            experiment_before = self.store.experiment(wid)
             self.check_experiment(wid, workflow, now)
+            experiment_after = self.store.experiment(wid)
+            pending_after = self.store.open_proposals(wid)
+            experiment_changed = (
+                experiment_before is None and experiment_after is not None
+            ) or (
+                experiment_before is not None
+                and experiment_after is not None
+                and (
+                    experiment_before.phase != experiment_after.phase
+                    or experiment_before.last_action_at != experiment_after.last_action_at
+                )
+            )
+            checks.append({
+                "check": "experiment",
+                "outcome": (
+                    "proposal_created" if pending_after
+                    else "experiment_state_changed" if experiment_changed
+                    else "no_action"
+                ),
+                "phase_before": experiment_before.phase if experiment_before else None,
+                "phase_after": experiment_after.phase if experiment_after else None,
+                "pending_proposal_ids": [
+                    proposal["proposal_id"] for proposal in pending_after
+                ],
+                "reason": (
+                    None if pending_after or experiment_changed
+                    else "no experiment action met its eligibility or evidence thresholds"
+                ),
+            })
+            self._audit_decision_checks(wid, now, checks)
+
+    def _audit_decision_checks(
+        self, workflow_id: str, now: str, checks: list[dict[str, Any]]
+    ) -> None:
+        self.store.audit(
+            now,
+            workflow_id,
+            "decision_checks",
+            {"checks": checks},
+            event_key=f"decision_checks:{workflow_id}:{now}",
+        )
 
     def within_approver_hours(self, workflow: dict[str, Any], now: str) -> bool:
         hour = parse_ts(now).hour

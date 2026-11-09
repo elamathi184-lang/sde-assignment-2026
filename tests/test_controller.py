@@ -99,6 +99,65 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
     store.close()
 
 
+def test_decision_checks_are_audited_once_per_workflow_timestamp(tmp_path):
+    class NoActionController(DecisionMixin):
+        def __init__(self):
+            self.store = Store(tmp_path / "controller.sqlite3")
+            self.workflows = {"wf": {}}
+
+        def caller_id_incident(self, workflow_id, workflow, now):
+            return None
+
+        def prompt_incident(self, workflow_id, workflow, now, credits):
+            return None
+
+        def check_experiment(self, workflow_id, workflow, now):
+            return None
+
+    controller = NoActionController()
+    state = {"ts": "2027-01-04T10:00:00+00:00", "credits_remaining": 200}
+    controller.make_decisions(state)
+    controller.make_decisions(state)
+
+    with controller.store.session_factory() as session:
+        rows = session.query(AuditRecord).filter_by(kind="decision_checks").all()
+        assert len(rows) == 1
+        assert rows[0].event_key == "decision_checks:wf:2027-01-04T10:00:00+00:00"
+        checks = json.loads(rows[0].detail)["checks"]
+        assert [(check["check"], check["outcome"]) for check in checks] == [
+            ("caller_id_health", "no_action"),
+            ("prompt_incident", "no_action"),
+            ("experiment", "no_action"),
+        ]
+    controller.store.close()
+
+
+def test_store_migrates_existing_audit_table_for_idempotent_events(tmp_path):
+    path = tmp_path / "controller.sqlite3"
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "ts VARCHAR NOT NULL, workflow_id VARCHAR, kind VARCHAR NOT NULL, detail TEXT NOT NULL)"
+        )
+    engine.dispose()
+
+    store = Store(path)
+    store.audit(
+        "2027-01-04T10:00:00+00:00",
+        "wf",
+        "decision_checks",
+        {"checks": []},
+        event_key="decision_checks:wf:2027-01-04T10:00:00+00:00",
+    )
+    columns = {column["name"] for column in inspect(store.engine).get_columns("audit")}
+    assert "event_key" in columns
+    with store.session_factory() as session:
+        row = session.query(AuditRecord).filter_by(kind="decision_checks").one()
+        assert row.event_key == "decision_checks:wf:2027-01-04T10:00:00+00:00"
+    store.close()
+
+
 def test_caller_id_incident_changes_only_the_affected_cohort():
     class IncidentStore:
         def latest_proposal(self, workflow_id, kind, state):
