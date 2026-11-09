@@ -1,6 +1,9 @@
 import json
 
 import pytest
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from controller import (
     Store,
@@ -10,6 +13,13 @@ from controller import (
     max_distribution_shift,
     sequential_look,
     wilson_interval,
+)
+from autonomy_controller.models import (
+    AuditRecord,
+    ExperimentRecord,
+    LegacyBase,
+    LegacyCallRecord,
+    ProposalRecord,
 )
 
 
@@ -54,10 +64,7 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
         "hallucination_flags": 0,
     }
     assert calculate_rates(voice)["engagement_rate"] == 1
-    call = store.db.execute("SELECT workflow_id, variant, config_version FROM call_records").fetchone()
-    assert call["workflow_id"] == "wf"
-    assert json.loads(call["variant"])["voice"] == "V1"
-    assert call["config_version"] == 1
+    assert not inspect(store.engine).has_table("call_records")
     version_two_event = {**event, "event_id": 8, "config_version": 2, "variant": {
         **event["variant"], "voice": "V2",
     }}
@@ -81,29 +88,24 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
 
 def test_experiment_stats_backfills_legacy_rows_once_after_upgrade(tmp_path):
     path = tmp_path / "controller.sqlite3"
-    store = Store(path)
-    store.db.execute("DELETE FROM metadata WHERE key='experiment_counters_backfilled'")
-    store.db.execute(
-        """INSERT INTO call_records
-           (event_id, workflow_id, ts, lead_id, person_id, config_version, cohort_id,
-            variant, connected, engaged, qa)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            3,
-            "wf",
-            "2027-01-04T10:15:00+05:30",
-            "wf:l1",
-            "wf:p1",
-            1,
-            "default",
-            json.dumps({"voice": "V1"}),
-            1,
-            0,
-            json.dumps({"hallucination_flag": True}),
-        ),
-    )
-    store.db.commit()
-    store.close()
+    legacy_engine = create_engine(f"sqlite:///{path}")
+    LegacyBase.metadata.create_all(legacy_engine)
+    with Session(legacy_engine) as legacy_session:
+        legacy_session.add(
+            LegacyCallRecord(
+                event_id=3,
+                workflow_id="wf",
+                ts="2027-01-04T10:15:00+05:30",
+                config_version=1,
+                cohort_id="default",
+                variant=json.dumps({"voice": "V1"}),
+                connected=1,
+                engaged=0,
+                qa=json.dumps({"hallucination_flag": True}),
+            )
+        )
+        legacy_session.commit()
+    legacy_engine.dispose()
 
     store = Store(path)
     assert store.experiment_stats(
@@ -115,9 +117,104 @@ def test_experiment_stats_backfills_legacy_rows_once_after_upgrade(tmp_path):
         "qa_calls": 1,
         "hallucination_flags": 1,
     }
-    assert store.db.execute(
-        "SELECT value FROM metadata WHERE key='experiment_counters_backfilled'"
-    ).fetchone()["value"] == "1"
+    assert store.metadata_value("experiment_counters_backfilled") == "1"
+    assert not inspect(store.engine).has_table("call_records")
+    assert not inspect(store.engine).has_table("lead_records")
+    store.close()
+
+
+def test_finishing_proposal_updates_audit_and_experiment_atomically(tmp_path):
+    store = Store(tmp_path / "controller.sqlite3")
+    with store.session_factory.begin() as session:
+        session.add(ProposalRecord(
+            proposal_id="proposal-1",
+            workflow_id="wf",
+            kind="experiment_promote",
+            state="pending",
+            created_at="2027-01-04T10:00:00+00:00",
+            base_version=1,
+            payload="{}",
+        ))
+        session.add(ExperimentRecord(
+            workflow_id="wf",
+            dimension="voice",
+            cohort_id="default",
+            phase="exploring",
+            control="V1",
+            challenger="V2",
+            config_version=2,
+            started_at="2027-01-04T10:00:00+00:00",
+            baseline_config="{}",
+            last_action_at="2027-01-04T10:00:00+00:00",
+        ))
+
+    with pytest.raises(IntegrityError):
+        store.finish_proposal(
+            "proposal-1",
+            "wf",
+            "experiment_promote",
+            "applied",
+            "2027-01-04T11:00:00+00:00",
+            {"version": 3},
+            experiment_update={"phase": None},
+        )
+
+    with store.session_factory() as session:
+        assert session.get(ProposalRecord, "proposal-1").state == "pending"
+        assert session.get(ExperimentRecord, "wf").phase == "exploring"
+        assert session.query(AuditRecord).filter_by(kind="proposal_applied").count() == 0
+
+    store.finish_proposal(
+        "proposal-1",
+        "wf",
+        "experiment_promote",
+        "applied",
+        "2027-01-04T11:00:00+00:00",
+        {"version": 3},
+        experiment_update={"phase": "promoted", "config_version": 3},
+    )
+    with store.session_factory() as session:
+        assert session.get(ProposalRecord, "proposal-1").state == "applied"
+        experiment = session.get(ExperimentRecord, "wf")
+        assert experiment.phase == "promoted"
+        assert experiment.config_version == 3
+        assert session.query(AuditRecord).filter_by(kind="proposal_applied").count() == 1
+
+    with store.session_factory.begin() as session:
+        session.add(ProposalRecord(
+            proposal_id="proposal-2",
+            workflow_id="wf2",
+            kind="experiment_explore",
+            state="pending",
+            created_at="2027-01-04T10:00:00+00:00",
+            base_version=1,
+            payload="{}",
+        ))
+    store.finish_proposal(
+        "proposal-2",
+        "wf2",
+        "experiment_explore",
+        "applied",
+        "2027-01-04T11:00:00+00:00",
+        {"version": 2},
+        experiment_update={
+            "dimension": "voice",
+            "cohort_id": "default",
+            "phase": "exploring",
+            "control": "V1",
+            "challenger": "V2",
+            "config_version": 2,
+            "winner": None,
+            "started_at": "2027-01-04T11:00:00+00:00",
+            "promoted_at": None,
+            "baseline_config": "{}",
+            "baseline_pickup": None,
+            "baseline_engagement": None,
+            "last_action_at": "2027-01-04T11:00:00+00:00",
+        },
+    )
+    with store.session_factory() as session:
+        assert session.get(ExperimentRecord, "wf2").phase == "exploring"
     store.close()
 
 

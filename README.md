@@ -84,7 +84,13 @@ The controller stores its state in `runs/controller-state/<scenario>.sqlite3`. F
 same `CONTROLLER_STATE_DIR` and pass `--resume` (or set `CONTROLLER_RESUME=1`); the controller validates
 the saved scenario metadata before resuming. Use a fresh state directory for a new run, or a persistent
 mounted directory outside `runs/` if the run directory may be cleaned. Use a separate directory for each
-concurrent run.
+concurrent run. It persists hourly performance and per-version experiment aggregates rather than raw call
+or lead records. On upgrade, legacy call records are backfilled into experiment aggregates before both
+legacy call and lead tables are removed.
+The controller implementation is split into `autonomy_controller/`: `models.py` contains dataclasses and
+SQLAlchemy models, `store.py` owns ORM/Core persistence and migrations, `service.py` runs the controller,
+and `decisions.py`, `governance.py` and `statistics.py` hold the corresponding decision logic. SQLite
+queries and upserts use SQLAlchemy; driver SQL is limited to SQLite pragmas and schema migrations.
 To demonstrate a kill/restart recovery on public_01, run `bash scripts/crash_recovery_demo.sh`; it
 keeps the simulator, controller logs, and SQLite state under a timestamped `runs/crash-recovery-*` path.
 
