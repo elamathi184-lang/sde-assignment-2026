@@ -130,7 +130,7 @@ Detection works on populations, not individual calls:
 - Caller ID: 48-hour cohort-specific statistics; at least 100 dials on the candidate and 100 on alternatives; at least a 10 percentage-point pickup gap plus non-overlapping Wilson intervals.
 - Hallucination: at least 40 QA-observed connected calls, point rate ≥4%, and Wilson lower bound ≥2%. If credits are below the 10-credit reserve, the controller records the incident unresolved rather than calling the LLM. It checks at most two suggestions, validates each on 100 synthetic conversations, and requires the workflow's minimum validation pass rate. Validation measures safety, not engagement.
 
-**public_02 timeline:** The grader identifies the Kestrel caller-ID incident at D2 10:00; flagged-ID share fell from 49.9% on D2 to 6.3% on D9. The supervisor's bad prompt edit occurred at D3 11:30; the grader reports 270-minute MTTR and a controller-approved fix. The run used one LLM suggestion call, two validation runs, and five credits. A separate Northwind supervisor edit occurred at D5 15:00; the report does not claim a controller fix for it. Total hallucinated calls in the run were 151 versus 431 in baseline; this aggregate comparison is not proof that the prompt change alone caused the reduction.
+**public_02 timeline:** The grader identifies the Kestrel caller-ID incident at D2 10:00; flagged-ID share fell from 49.9% on D2 to 3.9% on D9. The supervisor's bad prompt edit occurred at D3 11:30; the latest run.sh replay reports 510-minute MTTR and a controller-approved fix. The run used one LLM suggestion call, two validation runs, and five credits. A separate Northwind supervisor edit occurred at D5 15:00; the report does not claim a controller fix for it. Total hallucinated calls in the run were 178 versus 431 in baseline; this aggregate comparison is not proof that the prompt change alone caused the reduction.
 
 ## 8. Scale
 
@@ -188,23 +188,23 @@ The controller currently logs progress, event IDs, credits, throughput, wall tim
 
 | Workflow | Conclusion rate | Δ | Pickup | Δ | Engagement | Δ | Hallucinated calls (base) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ks_cancel | 0.340 | -0.4% | 0.241 | -1.4% | 0.497 | +1.1% | 62 (57) |
-| nw_kyc | 0.443 | +20.8% | 0.293 | +21.1% | 0.586 | -1.9% | 27 (21) |
-| nw_renewal | 0.418 | +0.4% | 0.266 | +0.7% | 0.538 | -0.6% | 54 (54) |
-| **ALL** | **0.388** | **+4.4%** | **0.260** | **+3.6%** | **0.531** | **+0.3%** | **143 (132)** |
+| ks_cancel | 0.341 | -0.2% | 0.240 | -1.9% | 0.500 | +1.7% | 60 (57) |
+| nw_kyc | 0.443 | +20.8% | 0.288 | +19.2% | 0.595 | -0.4% | 39 (21) |
+| nw_renewal | 0.413 | -0.9% | 0.260 | -1.7% | 0.546 | +0.7% | 42 (54) |
+| **ALL** | **0.386** | **+3.9%** | **0.256** | **+2.1%** | **0.537** | **+1.4%** | **141 (132)** |
 
-Four changes were applied: two neutral and two beneficial by the grader. Kestrel pickup fell 1.4% while engagement rose 1.1%; the NW KYC and renewal rows show engagement regressions despite pickup/conclusion gains. Aggregate hallucinated calls increased from 132 to 143, a regression worth investigating even though this scenario reported no incident.
+Five changes were applied: two neutral and three beneficial by the grader. The aggregate outcomes improved, but hallucinated calls increased from 132 to 141, and NW KYC hallucinated calls increased from 21 to 39. This regression is worth investigating even though this scenario reported no incident.
 
 ### public_02
 
 | Workflow | Conclusion rate | Δ | Pickup | Δ | Engagement | Δ | Hallucinated calls (base) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ks_cancel | 0.284 | +20.6% | 0.196 | +7.9% | 0.508 | +8.7% | 64 (348) |
-| nw_kyc | 0.431 | +15.3% | 0.278 | +18.5% | 0.587 | -3.6% | 35 (29) |
-| nw_renewal | 0.435 | +0.5% | 0.263 | +0.4% | 0.554 | -0.1% | 52 (54) |
-| **ALL** | **0.366** | **+10.5%** | **0.235** | **+7.0%** | **0.544** | **+2.1%** | **151 (431)** |
+| ks_cancel | 0.284 | +20.7% | 0.199 | +10.0% | 0.499 | +6.7% | 85 (348) |
+| nw_kyc | 0.445 | +19.2% | 0.285 | +21.4% | 0.590 | -3.0% | 35 (29) |
+| nw_renewal | 0.438 | +1.3% | 0.263 | +0.3% | 0.558 | +0.7% | 58 (54) |
+| **ALL** | **0.370** | **+11.8%** | **0.238** | **+8.3%** | **0.543** | **+1.9%** | **178 (431)** |
 
-Twelve changes were applied (seven beneficial, five neutral in grader classification); one approval was rejected. NW KYC's engagement fell 3.6% while its primary pickup measure rose 18.5%, so the engagement guardrail deserves review rather than being hidden by the aggregate. Kestrel's flagged caller-ID share and bad-prompt incident improved, but the report shows no decaying variants and does not prove that the rollback path works.
+Eleven changes were applied (seven beneficial, four neutral in grader classification); one approval was rejected and three changes auto-applied under policy. NW KYC's engagement fell 3.0% while its primary pickup measure rose 21.4%, so the engagement guardrail deserves review rather than being hidden by the aggregate. Kestrel's flagged caller-ID share and bad-prompt incident improved, but MTTR was 510 minutes. The report shows no decaying variants and does not prove that the rollback path works.
 
 Full `sim grade` outputs are retained in `reports/public_01.md` and `reports/public_02.md`; the current-tree load outcome table is in `reports/public_03_load.md`.
 
