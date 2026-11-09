@@ -65,8 +65,59 @@ def test_store_ingestion_is_idempotent_and_aggregates_calls(tmp_path):
     experiment_stats = store.experiment_stats(
         "wf", "voice", "2027-01-04T00:00:00+05:30", config_version=2
     )
-    assert experiment_stats["V2"]["dials"] == 1
+    assert experiment_stats["V2"] == {
+        "dials": 1,
+        "connected": 1,
+        "engaged": 1,
+        "qa_calls": 1,
+        "hallucination_flags": 0,
+    }
     assert "V1" not in experiment_stats
+    assert store.experiment_stats(
+        "wf", "voice", "2027-01-04T10:30:00+05:30", config_version=2
+    ) == {}
+    store.close()
+
+
+def test_experiment_stats_backfills_legacy_rows_once_after_upgrade(tmp_path):
+    path = tmp_path / "controller.sqlite3"
+    store = Store(path)
+    store.db.execute("DELETE FROM metadata WHERE key='experiment_counters_backfilled'")
+    store.db.execute(
+        """INSERT INTO call_records
+           (event_id, workflow_id, ts, lead_id, person_id, config_version, cohort_id,
+            variant, connected, engaged, qa)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            3,
+            "wf",
+            "2027-01-04T10:15:00+05:30",
+            "wf:l1",
+            "wf:p1",
+            1,
+            "default",
+            json.dumps({"voice": "V1"}),
+            1,
+            0,
+            json.dumps({"hallucination_flag": True}),
+        ),
+    )
+    store.db.commit()
+    store.close()
+
+    store = Store(path)
+    assert store.experiment_stats(
+        "wf", "voice", "2027-01-04T10:00:00+05:30", config_version=1
+    )["V1"] == {
+        "dials": 1,
+        "connected": 1,
+        "engaged": 0,
+        "qa_calls": 1,
+        "hallucination_flags": 1,
+    }
+    assert store.db.execute(
+        "SELECT value FROM metadata WHERE key='experiment_counters_backfilled'"
+    ).fetchone()["value"] == "1"
     store.close()
 
 

@@ -97,8 +97,6 @@ class Store:
                 qa TEXT
             );
             CREATE INDEX IF NOT EXISTS calls_workflow_ts ON call_records(workflow_id, ts);
-            CREATE INDEX IF NOT EXISTS calls_experiment_lookup
-                ON call_records(workflow_id, config_version, cohort_id, ts);
             CREATE TABLE IF NOT EXISTS hourly_stats (
                 workflow_id TEXT NOT NULL,
                 cohort_id TEXT NOT NULL,
@@ -114,6 +112,20 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS stats_lookup
                 ON hourly_stats(workflow_id, dimension, cohort_id, hour);
+            CREATE TABLE IF NOT EXISTS experiment_counters (
+                workflow_id TEXT NOT NULL,
+                config_version INTEGER NOT NULL,
+                cohort_id TEXT NOT NULL,
+                dimension TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                dials INTEGER NOT NULL DEFAULT 0,
+                connected INTEGER NOT NULL DEFAULT 0,
+                engaged INTEGER NOT NULL DEFAULT 0,
+                qa_calls INTEGER NOT NULL DEFAULT 0,
+                hallucination_flags INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(workflow_id, config_version, dimension, cohort_id, ts, variant)
+            );
             CREATE TABLE IF NOT EXISTS proposals (
                 proposal_id TEXT PRIMARY KEY,
                 workflow_id TEXT NOT NULL,
@@ -166,6 +178,44 @@ class Store:
         if resume and not has_cursors:
             self.db.close()
             raise RuntimeError(f"cannot resume {path}: no persisted simulator cursor was found")
+        with self.db:
+            self.db.execute("DROP INDEX IF EXISTS calls_experiment_lookup")
+            row = self.db.execute(
+                "SELECT 1 FROM metadata WHERE key='experiment_counters_backfilled'"
+            ).fetchone()
+            if row is None:
+                self.db.execute(
+                    """WITH dimensions(name) AS (
+                           SELECT 'voice' UNION ALL
+                           SELECT 'welcome_message' UNION ALL
+                           SELECT 'caller_id' UNION ALL
+                           SELECT 'prompt_version'
+                       ), expanded AS (
+                           SELECT c.workflow_id, c.config_version, c.cohort_id, d.name AS dimension,
+                                  json_extract(c.variant, '$.' || d.name) AS variant, c.ts,
+                                  c.connected, c.engaged,
+                                  CASE WHEN c.connected
+                                            AND json_type(c.qa, '$.hallucination_flag') IS NOT NULL
+                                       THEN 1 ELSE 0 END AS qa_calls,
+                                  CASE WHEN c.connected
+                                            AND json_extract(c.qa, '$.hallucination_flag') = 1
+                                       THEN 1 ELSE 0 END AS hallucination_flags
+                           FROM call_records c
+                           CROSS JOIN dimensions d
+                           WHERE json_type(c.variant, '$.' || d.name) IS NOT NULL
+                       )
+                       INSERT INTO experiment_counters
+                           (workflow_id, config_version, cohort_id, dimension, variant, ts, dials,
+                            connected, engaged, qa_calls, hallucination_flags)
+                       SELECT workflow_id, config_version, cohort_id, dimension, variant, ts,
+                              COUNT(*), SUM(connected), SUM(engaged), SUM(qa_calls),
+                              SUM(hallucination_flags)
+                       FROM expanded
+                       GROUP BY workflow_id, config_version, cohort_id, dimension, variant, ts"""
+                )
+                self.db.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('experiment_counters_backfilled', '1')"
+                )
         self.db.commit()
 
     def close(self) -> None:
@@ -202,38 +252,27 @@ class Store:
         cohort_id: str | None = None,
         until: str | None = None,
     ) -> dict[str, dict[str, int]]:
-        variant_key = {
-            "voice": "voice",
-            "welcome_message": "welcome_message",
-            "caller_id": "caller_id",
-            "prompt_version": "prompt_version",
-        }[dimension]
-        sql = """SELECT variant, connected, engaged, qa FROM call_records
-                 WHERE workflow_id=? AND config_version=? AND ts>=?"""
-        args: list[Any] = [workflow_id, config_version, since]
+        sql = """SELECT variant, SUM(dials) AS dials, SUM(connected) AS connected,
+                        SUM(engaged) AS engaged, SUM(qa_calls) AS qa_calls,
+                        SUM(hallucination_flags) AS hallucination_flags
+                 FROM experiment_counters
+                 WHERE workflow_id=? AND config_version=? AND dimension=? AND ts>=?"""
+        args: list[Any] = [workflow_id, config_version, dimension, since]
         if cohort_id is not None:
             sql += " AND cohort_id=?"
             args.append(cohort_id)
         if until is not None:
             sql += " AND ts<?"
             args.append(until)
-        result: dict[str, dict[str, int]] = {}
-        for row in self.db.execute(sql, args):
-            variant = json.loads(row["variant"]).get(variant_key)
-            if variant is None:
-                continue
-            values = result.setdefault(
-                str(variant),
-                {"dials": 0, "connected": 0, "engaged": 0, "qa_calls": 0, "hallucination_flags": 0},
-            )
-            values["dials"] += 1
-            values["connected"] += row["connected"]
-            values["engaged"] += row["engaged"]
-            qa = json.loads(row["qa"] or "{}")
-            values["qa_calls"] += int(bool(row["connected"]) and "hallucination_flag" in qa)
-            values["hallucination_flags"] += int(
-                bool(row["connected"]) and bool(qa.get("hallucination_flag"))
-            )
+        sql += " GROUP BY variant"
+        result = {
+            row["variant"]: {
+                name: int(row[name] or 0)
+                for name in ("dials", "connected", "engaged", "qa_calls", "hallucination_flags")
+            }
+            for row in self.db.execute(sql, args)
+        }
+
         return result
 
     def first_observation_time(self, workflow_id: str) -> str | None:
@@ -269,6 +308,9 @@ class Store:
         calls = []
         leads = []
         stats: dict[tuple[str, str, str, str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+        experiment_stats: dict[tuple[str, int, str, str, str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0, 0]
+        )
         for event in events:
             event_type = event["type"]
             if event_type == "call":
@@ -299,6 +341,16 @@ class Store:
                     counts[2] += engaged
                     counts[3] += qa_calls
                     counts[4] += hallucination_flags
+                    experiment_key = (
+                        event["workflow_id"], event["config_version"], cohort, dimension,
+                        str(option), event["ts"],
+                    )
+                    experiment_counts = experiment_stats[experiment_key]
+                    experiment_counts[0] += 1
+                    experiment_counts[1] += connected
+                    experiment_counts[2] += engaged
+                    experiment_counts[3] += qa_calls
+                    experiment_counts[4] += hallucination_flags
             elif event_type == "lead":
                 leads.append(
                     (
@@ -364,6 +416,18 @@ class Store:
                      engaged=engaged+excluded.engaged, qa_calls=qa_calls+excluded.qa_calls,
                      hallucination_flags=hallucination_flags+excluded.hallucination_flags""",
                 [(*key, *counts) for key, counts in stats.items()],
+            )
+        if experiment_stats:
+            self.db.executemany(
+                """INSERT INTO experiment_counters
+                   (workflow_id, config_version, cohort_id, dimension, variant, ts, dials,
+                    connected, engaged, qa_calls, hallucination_flags)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(workflow_id, config_version, cohort_id, dimension, ts, variant)
+                   DO UPDATE SET dials=dials+excluded.dials, connected=connected+excluded.connected,
+                     engaged=engaged+excluded.engaged, qa_calls=qa_calls+excluded.qa_calls,
+                     hallucination_flags=hallucination_flags+excluded.hallucination_flags""",
+                [(*key, *counts) for key, counts in experiment_stats.items()],
             )
         return len(events)
 
